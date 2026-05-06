@@ -48,6 +48,8 @@ class AnimState(Enum):
     WALKING = auto()
     ATTACKING = auto()
     HIT_REACT = auto()
+    JUMPING = auto()
+    DASHING = auto()
 
 
 # ======================================================================
@@ -88,6 +90,17 @@ class Player:
     DECEL_SMOOTH = 8.0
     TURN_SMOOTH = 10.0
 
+    # Jump mechanics
+    JUMP_FORCE = 18.0        # initial upward velocity
+    JUMP_COOLDOWN = 0.5      # seconds between jumps
+    GRAVITY_ACCEL = 25.0     # matches planet gravity
+
+    # Dash mechanics
+    DASH_SPEED = 35.0        # speed during dash
+    DASH_DURATION = 0.25     # seconds of dash movement
+    DASH_MAX_CHARGES = 2     # maximum charges
+    DASH_RECHARGE_TIME = 2.5 # seconds to recharge one charge
+
     # Attack timing
     ATTACK_WINDUP = 0.12     # seconds — wind-up phase
     ATTACK_SLASH = 0.15      # seconds — slash phase
@@ -117,6 +130,18 @@ class Player:
 
         # Smoothed velocity
         self._velocity = Vec3(0, 0, 0)
+
+        # Jump state
+        self._is_jumping = False
+        self._vertical_velocity = 0.0
+        self._jump_cooldown_timer = 0.0
+
+        # Dash state
+        self._is_dashing = False
+        self._dash_timer = 0.0
+        self._dash_direction = Vec3(0, 1, 0)
+        self._dash_charges = self.DASH_MAX_CHARGES
+        self._dash_recharge_timer = 0.0
 
         # ── Build hierarchical skeleton ───────────────────────────────
         self.node = make_player_mesh()
@@ -201,42 +226,95 @@ class Player:
     # Per-frame update
     # ------------------------------------------------------------------
 
-    def update(self, dt, input_vec, camera_forward_hint):
+    def update(self, dt, input_vec, camera_forward_hint, jump_pressed=False, dash_pressed=False):
         """
         Move the player on the sphere surface and advance animations.
 
         *input_vec*: Vec3 with x = right/left, y = forward/back (WASD).
         *camera_forward_hint*: camera's look direction on the tangent plane.
+        *jump_pressed*: True if jump key was pressed this frame.
+        *dash_pressed*: True if dash key was pressed this frame.
         """
+        # Update jump cooldown
+        if self._jump_cooldown_timer > 0:
+            self._jump_cooldown_timer -= dt
+
+        # Update dash recharge
+        if self._dash_charges < self.DASH_MAX_CHARGES:
+            self._dash_recharge_timer += dt
+            if self._dash_recharge_timer >= self.DASH_RECHARGE_TIME:
+                self._dash_charges += 1
+                self._dash_recharge_timer = 0.0
+
         up = self.planet.local_up(self.position)
+
+        # Handle jump input
+        if jump_pressed and not self._is_jumping and self._jump_cooldown_timer <= 0:
+            self._is_jumping = True
+            self._vertical_velocity = self.JUMP_FORCE
+            self._jump_cooldown_timer = self.JUMP_COOLDOWN
+
+        # Handle dash input (can't dash in air)
+        if dash_pressed and not self._is_dashing and not self._is_jumping and self._dash_charges > 0:
+            self._is_dashing = True
+            self._dash_timer = self.DASH_DURATION
+            self._dash_charges -= 1
+            # If there's input, dash in that direction; otherwise dash forward
+            if input_vec.length() > 0.01:
+                # Calculate dash direction based on input
+                right, fwd, _ = tangent_frame(
+                    self.position, camera_forward_hint, self.planet.center
+                )
+                self._dash_direction = fwd * input_vec.y + right * input_vec.x
+            else:
+                self._dash_direction = self._forward
+            self._dash_direction = normalized(self._dash_direction)
 
         # Build tangent frame from camera hint
         right, fwd, up = tangent_frame(
             self.position, camera_forward_hint, self.planet.center
         )
 
+        # Update dash timer
+        if self._is_dashing:
+            self._dash_timer -= dt
+            if self._dash_timer <= 0:
+                self._is_dashing = False
+
         # Desired movement
         has_input = input_vec.length() > 0.01
-        if has_input:
-            target_dir = fwd * input_vec.y + right * input_vec.x
-            if target_dir.length() > 0.01:
-                target_dir = normalized(target_dir)
-            target_vel = target_dir * self.MOVE_SPEED
-        else:
-            target_vel = Vec3(0, 0, 0)
 
-        # Smooth velocity
-        smooth = self.ACCEL_SMOOTH if has_input else self.DECEL_SMOOTH
-        t = min(1.0, smooth * dt)
-        self._velocity = lerp_vec3(self._velocity, target_vel, t)
+        # If dashing, override normal movement
+        if self._is_dashing:
+            # Dash movement - fast and direct
+            target_vel = self._dash_direction * self.DASH_SPEED
+            self._velocity = target_vel
+        else:
+            # Normal movement
+            if has_input:
+                target_dir = fwd * input_vec.y + right * input_vec.x
+                if target_dir.length() > 0.01:
+                    target_dir = normalized(target_dir)
+                target_vel = target_dir * self.MOVE_SPEED
+            else:
+                target_vel = Vec3(0, 0, 0)
+
+            # Smooth velocity
+            smooth = self.ACCEL_SMOOTH if has_input else self.DECEL_SMOOTH
+            t = min(1.0, smooth * dt)
+            self._velocity = lerp_vec3(self._velocity, target_vel, t)
 
         # Apply velocity
         if self._velocity.length() > 0.05:
             self.position += self._velocity * dt
-            self.position = snap_to_surface(
-                self.position, self.planet.radius, self.HEIGHT_OFFSET,
-                self.planet.center
-            )
+
+            # Only snap to surface if not jumping
+            if not self._is_jumping:
+                self.position = snap_to_surface(
+                    self.position, self.planet.radius, self.HEIGHT_OFFSET,
+                    self.planet.center
+                )
+
             new_up = self.planet.local_up(self.position)
             self._velocity = self._velocity - new_up * self._velocity.dot(new_up)
 
@@ -249,6 +327,25 @@ class Player:
             _, self._forward, _ = tangent_frame(
                 self.position, self._forward, self.planet.center
             )
+
+        # Jump physics
+        if self._is_jumping:
+            # Apply gravity to vertical velocity
+            self._vertical_velocity -= self.GRAVITY_ACCEL * dt
+
+            # Apply vertical movement
+            self.position += up * self._vertical_velocity * dt
+
+            # Check if landed back on surface
+            dist_from_surface = self.planet.distance_to_surface(self.position)
+            if dist_from_surface <= self.HEIGHT_OFFSET:
+                # Snap back to surface
+                self.position = snap_to_surface(
+                    self.position, self.planet.radius, self.HEIGHT_OFFSET,
+                    self.planet.center
+                )
+                self._is_jumping = False
+                self._vertical_velocity = 0.0
 
         # Advance animation timers
         self._anim_time += dt
@@ -287,6 +384,7 @@ class Player:
 
     def _update_anim_state(self, has_input, dt):
         """Transition between animation states based on gameplay."""
+        # Hit react and attacking take priority over jump and dash
         if self._hit_reacting:
             self._hit_timer += dt
             if self._hit_timer >= self._hit_duration:
@@ -300,9 +398,25 @@ class Player:
             self._attack_timer += dt
             if self._attack_timer >= self.ATTACK_DURATION:
                 self._attacking = False
-                self._set_state(AnimState.IDLE if not has_input else AnimState.WALKING)
+                # Return to jump if still jumping, dash if dashing, else idle/walking
+                if self._is_jumping:
+                    self._set_state(AnimState.JUMPING)
+                elif self._is_dashing:
+                    self._set_state(AnimState.DASHING)
+                else:
+                    self._set_state(AnimState.IDLE if not has_input else AnimState.WALKING)
             else:
                 self._set_state(AnimState.ATTACKING)
+            return
+
+        # Dash animation takes priority over jump
+        if self._is_dashing:
+            self._set_state(AnimState.DASHING)
+            return
+
+        # Jump animation only when not attacking or dashing
+        if self._is_jumping:
+            self._set_state(AnimState.JUMPING)
             return
 
         if has_input:
@@ -346,6 +460,10 @@ class Player:
             self._pose_attack(pose, st)
         elif state == AnimState.HIT_REACT:
             self._pose_hit_react(pose, st)
+        elif state == AnimState.JUMPING:
+            self._pose_jump(pose, st)
+        elif state == AnimState.DASHING:
+            self._pose_dash(pose, st)
 
         return pose
 
@@ -527,6 +645,78 @@ class Player:
         pose['shoulder_L_joint'] = (10 * flinch, 15 * flinch, 0)
         pose['shoulder_R_joint'] = (-10 * flinch, 15 * flinch, 0)
 
+    def _pose_jump(self, pose, st):
+        """
+        Jump pose: arms and legs extended for aerial attack.
+        Sword held ready to strike meteors in mid-air.
+        """
+        # Determine jump phase based on vertical velocity
+        if self._vertical_velocity > 0:
+            # Rising — legs tucked, arms up
+            tuck = min(1.0, abs(self._vertical_velocity) / self.JUMP_FORCE)
+            pose['hips_joint'] = (0, 15 * tuck, 0)
+            pose['knee_L_joint'] = (0, -45 * tuck, 0)
+            pose['knee_R_joint'] = (0, -45 * tuck, 0)
+            pose['hip_L_joint'] = (0, 30 * tuck, 0)
+            pose['hip_R_joint'] = (0, 30 * tuck, 0)
+        else:
+            # Falling — legs extended
+            extend = min(1.0, abs(self._vertical_velocity) / 10.0)
+            pose['knee_L_joint'] = (0, -10 * extend, 0)
+            pose['knee_R_joint'] = (0, -10 * extend, 0)
+            pose['hip_L_joint'] = (0, -15 * extend, 0)
+            pose['hip_R_joint'] = (0, -15 * extend, 0)
+
+        # Sword arm ready for aerial strike
+        pose['shoulder_R_joint'] = (0, 60, 0)
+        pose['elbow_R_joint'] = (0, -20, 0)
+
+        # Left arm out for balance
+        pose['shoulder_L_joint'] = (-30, 20, 0)
+        pose['elbow_L_joint'] = (0, -10, 0)
+
+        # Spine leans forward slightly
+        pose['spine_joint'] = (0, 10, 0)
+        pose['head_joint'] = (0, -5, 0)
+
+    def _pose_dash(self, pose, st):
+        """
+        Dash pose: dynamic forward-leaning sprint with speed lines feeling.
+        Inspired by anime-style dashes with dramatic lean and streamlined form.
+        """
+        # Progress through dash (0.0 to 1.0)
+        progress = st / self.DASH_DURATION if self.DASH_DURATION > 0 else 1.0
+
+        # Dramatic forward lean - starts strong, eases out
+        lean_intensity = 1.0 - ease_out_cubic(progress)
+        lean = 35 * lean_intensity  # Deep forward lean
+
+        # Body positioning for aerodynamic "speed" feel
+        pose['spine_joint'] = (0, lean, 0)
+        pose['hips_joint'] = (0, lean * 0.6, 0)
+        pose['head_joint'] = (0, -lean * 0.3, 0)  # Counter-rotate head slightly
+
+        # Legs - running stride but exaggerated
+        # Create alternating leg motion
+        import math
+        stride_phase = math.sin(progress * math.pi * 4) * lean_intensity
+
+        # Left leg forward, right back (or vice versa based on phase)
+        pose['hip_L_joint'] = (0, stride_phase * 40, 0)
+        pose['knee_L_joint'] = (0, -abs(stride_phase) * 35 - 10, 0)
+
+        pose['hip_R_joint'] = (0, -stride_phase * 40, 0)
+        pose['knee_R_joint'] = (0, -abs(stride_phase) * 35 - 10, 0)
+
+        # Arms - streamlined behind for speed
+        # Left arm sweeps back
+        pose['shoulder_L_joint'] = (0, -40 * lean_intensity, -10 * lean_intensity)
+        pose['elbow_L_joint'] = (0, -50 * lean_intensity, 0)
+
+        # Right arm (sword arm) extended forward for balance and momentum
+        pose['shoulder_R_joint'] = (0, 80 * lean_intensity, 5 * lean_intensity)
+        pose['elbow_R_joint'] = (0, -20 * lean_intensity, 0)
+
     # ------------------------------------------------------------------
     # Sword swing interface (called by CombatSystem)
     # ------------------------------------------------------------------
@@ -543,6 +733,23 @@ class Player:
     @property
     def is_swinging(self):
         return self._attacking
+
+    @property
+    def is_jumping(self):
+        """Returns True if player is currently in the air."""
+        return self._is_jumping
+
+    @property
+    def dash_charges(self):
+        """Returns current number of dash charges (0-2)."""
+        return self._dash_charges
+
+    @property
+    def dash_recharge_progress(self):
+        """Returns progress toward next charge (0.0 to 1.0)."""
+        if self._dash_charges >= self.DASH_MAX_CHARGES:
+            return 0.0
+        return self._dash_recharge_timer / self.DASH_RECHARGE_TIME
 
     def take_hit(self):
         """Trigger the hit-react animation."""

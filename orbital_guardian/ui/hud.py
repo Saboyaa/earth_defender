@@ -76,6 +76,30 @@ class HUD:
         )
         self._elements.extend([self._cd_bg, self._cd_fg, self._cd_label])
 
+        # --- Dash charges indicator (bottom center) ---
+        self._dash_label = OnscreenText(
+            text='DASH', pos=(0, -0.90), scale=0.035,
+            fg=(0.5, 0.8, 1.0, 0.9), shadow=(0, 0, 0, 0.5),
+            parent=self.root, mayChange=True
+        )
+        self._elements.append(self._dash_label)
+
+        # Two charge indicators
+        self._dash_charges = []
+        for i in range(2):
+            # Background (empty state)
+            bg = self._make_bar(
+                self.root, pos=(-0.08 + i * 0.08, 0, -0.94), sx=0.03, sy=0.03,
+                color=Vec4(0.2, 0.2, 0.3, 0.6)
+            )
+            # Foreground (charged state)
+            fg = self._make_bar(
+                self.root, pos=(-0.08 + i * 0.08, 0, -0.94), sx=0.03, sy=0.03,
+                color=Vec4(0.3, 0.9, 1.0, 0.95)
+            )
+            self._dash_charges.append((bg, fg))
+            self._elements.extend([bg, fg])
+
         # --- Directional arrows (pre-allocated pool) ---
         self._arrows = []
         for _ in range(self.MAX_ARROWS):
@@ -149,7 +173,7 @@ class HUD:
         np.setTransparency(TransparencyAttrib.MAlpha)
         return np
 
-    def update(self, health_frac, score, wave, cooldown_frac):
+    def update(self, health_frac, score, wave, cooldown_frac, dash_charges=2, dash_recharge_progress=0.0):
         # Health bar
         self._health_fg.setScale(0.6 * max(0.0, health_frac), 1, 0.03)
         self._health_fg.setX(-0.6 * (1.0 - max(0.0, health_frac)))
@@ -161,6 +185,23 @@ class HUD:
         ready = 1.0 - cooldown_frac
         self._cd_fg.setScale(0.15 * ready, 1, 0.015)
         self._cd_fg.setX(-0.15 * (1.0 - ready))
+
+        # Dash charges
+        for i in range(2):
+            bg, fg = self._dash_charges[i]
+            if i < dash_charges:
+                # Fully charged
+                fg.show()
+                fg.setColorScale(1.0, 1.0, 1.0, 1.0)
+            elif i == dash_charges and dash_recharge_progress > 0:
+                # Recharging
+                fg.show()
+                # Pulsing recharge effect
+                pulse = 0.5 + 0.5 * dash_recharge_progress
+                fg.setColorScale(pulse, pulse, pulse, 0.8 * dash_recharge_progress)
+            else:
+                # Empty
+                fg.hide()
 
     def update_arrows(self, meteor_screen_data):
         """

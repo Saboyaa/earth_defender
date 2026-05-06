@@ -30,7 +30,7 @@ from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import (
     Vec3, Vec4, Shader, WindowProperties, ClockObject,
     AntialiasAttrib, TransparencyAttrib, TextNode, loadPrcFileData,
-    KeyboardButton, MouseButton,
+    KeyboardButton, MouseButton, AudioSound,
 )
 
 # Panda3D config — must be set before ShowBase.__init__
@@ -44,6 +44,7 @@ from core.camera_rig import CameraRig
 from core.meteor_spawner import MeteorSpawner
 from core.combat import CombatSystem
 from core.impact_predictor import ImpactPredictor
+from core.health_pickup import HealthPickupSpawner
 from graphics.procedural_meshes import make_skybox_mesh
 from graphics.particles import ParticleManager
 from graphics.lighting import setup_lighting
@@ -56,6 +57,7 @@ from ui.hud import HUD
 STATE_MENU = 'menu'
 STATE_PLAYING = 'playing'
 STATE_GAME_OVER = 'game_over'
+STATE_VICTORY = 'victory'
 
 
 class OrbitalGuardian(ShowBase):
@@ -83,6 +85,8 @@ class OrbitalGuardian(ShowBase):
         self._keys = {
             'w': False, 's': False, 'a': False, 'd': False,
             'attack': False,
+            'jump': False,
+            'dash': False,
         }
         self._setup_input()
 
@@ -90,6 +94,7 @@ class OrbitalGuardian(ShowBase):
         self.state = STATE_MENU
         self._menu_text = None
         self._gameover_text = None
+        self._victory_text = None
 
         # Core systems (created on game start)
         self._planet = None
@@ -99,6 +104,7 @@ class OrbitalGuardian(ShowBase):
         self._combat = None
         self._particles = None
         self._impact_predictor = None
+        self._health_spawner = None
         self._hud = None
         self._lights = None
         self._skybox = None
@@ -111,11 +117,53 @@ class OrbitalGuardian(ShowBase):
         # Trail spawn timer
         self._trail_timer = 0.0
 
+        # Background music
+        self._background_music = None
+        self._setup_audio()
+
         # Show menu
         self._enter_menu()
 
         # Main update task
         self.taskMgr.add(self._update, 'game_update')
+
+    # ------------------------------------------------------------------
+    # Audio system with error handling
+    # ------------------------------------------------------------------
+
+    def _setup_audio(self):
+        """
+        Load and play background music in loop.
+        If audio fails to load, the game continues without music.
+        """
+        try:
+            # Try to load the soundtrack
+            soundtrack_path = os.path.join('utils', 'soundtrack.m4a')
+
+            if not os.path.exists(soundtrack_path):
+                print(f'[AUDIO] Soundtrack not found at {soundtrack_path}, continuing without music.')
+                return
+
+            # Load the audio file
+            self._background_music = self.loader.loadSfx(soundtrack_path)
+
+            if self._background_music:
+                # Set volume (0.0 to 1.0)
+                self._background_music.setVolume(0.5)
+
+                # Play in loop
+                self._background_music.setLoop(True)
+                self._background_music.play()
+
+                print('[AUDIO] Background music loaded and playing.')
+            else:
+                print('[AUDIO] Failed to load soundtrack, continuing without music.')
+
+        except Exception as e:
+            # If anything goes wrong, just print a warning and continue
+            print(f'[AUDIO] Error loading soundtrack: {e}')
+            print('[AUDIO] Game will continue without background music.')
+            self._background_music = None
 
     # ------------------------------------------------------------------
     # Input — uses multiple backends to work around Wayland/XWayland issues
@@ -149,6 +197,7 @@ class OrbitalGuardian(ShowBase):
             's': KeyboardButton.asciiKey('s'),
             'a': KeyboardButton.asciiKey('a'),
             'd': KeyboardButton.asciiKey('d'),
+            'q': KeyboardButton.asciiKey('q'),
             'space': KeyboardButton.space(),
             'enter': KeyboardButton.enter(),
             'r': KeyboardButton.asciiKey('r'),
@@ -221,6 +270,7 @@ class OrbitalGuardian(ShowBase):
         # See linux/input-event-codes.h
         evdev_keymap = {
             17: 'w', 31: 's', 30: 'a', 32: 'd',
+            16: 'q',  # KEY_Q
             57: 'space', 28: 'enter',  # KEY_ENTER
             19: 'r', 1: 'escape',
             96: 'enter',  # KEY_KPENTER (numpad)
@@ -325,11 +375,14 @@ class OrbitalGuardian(ShowBase):
         self._keys['a'] = self._is_down('a')
         self._keys['d'] = self._is_down('d')
         self._keys['attack'] = False  # reset each frame; set below if pressed
+        self._keys['jump'] = False    # reset each frame; set below if pressed
+        self._keys['dash'] = False    # reset each frame; set below if pressed
 
         # One-shot actions via polling/evdev edge detection
         space_press = self._just_pressed_poll('space') or self._just_pressed_evdev('space')
         enter_press = self._just_pressed_poll('enter') or self._just_pressed_evdev('enter')
         r_press = self._just_pressed_poll('r') or self._just_pressed_evdev('r')
+        q_press = self._just_pressed_poll('q') or self._just_pressed_evdev('q')
         esc_press = self._just_pressed_poll('escape') or self._just_pressed_evdev('escape')
         mouse_press = self._just_pressed_poll('mouse1')
 
@@ -341,12 +394,17 @@ class OrbitalGuardian(ShowBase):
                     import traceback
                     traceback.print_exc()
             elif self.state == STATE_PLAYING:
-                self._keys['attack'] = True
+                # SPACE now triggers dash instead of attack
+                self._keys['dash'] = True
 
         if mouse_press and self.state == STATE_PLAYING:
+            # Mouse click attacks
             self._keys['attack'] = True
 
-        if r_press and self.state == STATE_GAME_OVER:
+        if q_press and self.state == STATE_PLAYING:
+            self._keys['jump'] = True
+
+        if r_press and (self.state == STATE_GAME_OVER or self.state == STATE_VICTORY):
             try:
                 self._cleanup_game()
                 self._start_game()
@@ -361,7 +419,7 @@ class OrbitalGuardian(ShowBase):
         for name in self._btn_map:
             self._prev_poll[name] = self._is_down_poll(name)
         self._prev_poll['mouse1'] = self._is_down_poll('mouse1')
-        for name in ('w', 's', 'a', 'd', 'space', 'enter', 'r', 'escape'):
+        for name in ('w', 's', 'a', 'd', 'q', 'space', 'enter', 'r', 'escape'):
             self._evdev_prev[name] = self._is_down_evdev(name)
 
         # Periodic debug print (once every 3 seconds)
@@ -380,7 +438,8 @@ class OrbitalGuardian(ShowBase):
         self.state = STATE_MENU
         self._menu_text = OnscreenText(
             text='ORBITAL GUARDIAN\n\nDefend your planet from meteors!\n\n'
-                 'WASD to move   |   SPACE / Click to attack\n\n'
+                 'WASD to move   |   Q to jump   |   SPACE to dash\n'
+                 'Click to attack\n\n'
                  'Press SPACE or ENTER to Start',
             pos=(0, 0.1), scale=0.07,
             fg=(1, 1, 1, 1), shadow=(0, 0, 0, 0.7),
@@ -394,17 +453,21 @@ class OrbitalGuardian(ShowBase):
         if self._gameover_text:
             self._gameover_text.destroy()
             self._gameover_text = None
+        if self._victory_text:
+            self._victory_text.destroy()
+            self._victory_text = None
 
         self.state = STATE_PLAYING
 
         # --- Create world ---
         self._planet = Planet(self.render)
         self._player = Player(self._planet, self.render)
-        self._camera_rig = CameraRig(self.camera, self._player, self._planet)
+        self._camera_rig = CameraRig(self.camera, self._player, self._planet, base=self)
         self._spawner = MeteorSpawner(self._planet, self.render)
         self._combat = CombatSystem(self._player, self._spawner)
         self._particles = ParticleManager(self.render)
         self._impact_predictor = ImpactPredictor(self._planet, self.render)
+        self._health_spawner = HealthPickupSpawner(self._planet, self._player, self.render)
 
         # Skybox
         self._skybox = make_skybox_mesh(radius=500.0, subdivisions=2)
@@ -435,6 +498,22 @@ class OrbitalGuardian(ShowBase):
             parent=self.aspect2d, mayChange=False
         )
 
+    def _enter_victory(self):
+        self.state = STATE_VICTORY
+        score = self._combat.score if self._combat else 0
+        final_health = int((self._planet.health / self._planet.max_health) * 100)
+        self._hud.hide()
+        self._victory_text = OnscreenText(
+            text=f'VICTORY!\n\n'
+                 f'You defended your planet through 10 waves!\n\n'
+                 f'Final Score: {score}\n'
+                 f'Planet Health: {final_health}%\n\n'
+                 f'Press R to Play Again',
+            pos=(0, 0.1), scale=0.07,
+            fg=(0.2, 1.0, 0.4, 1), shadow=(0, 0, 0, 0.7),
+            parent=self.aspect2d, mayChange=False
+        )
+
     def _cleanup_game(self):
         """Tear down all game objects for a clean restart."""
         if self._spawner:
@@ -443,11 +522,16 @@ class OrbitalGuardian(ShowBase):
             self._particles.cleanup()
         if self._impact_predictor:
             self._impact_predictor.cleanup()
+        if self._health_spawner:
+            self._health_spawner.cleanup()
         if self._hud:
             self._hud.cleanup()
         if self._gameover_text:
             self._gameover_text.destroy()
             self._gameover_text = None
+        if self._victory_text:
+            self._victory_text.destroy()
+            self._victory_text = None
         # Remove scene nodes
         if self._planet:
             self._planet.node.removeNode()
@@ -463,6 +547,9 @@ class OrbitalGuardian(ShowBase):
             for lnp in self._lights.values():
                 self.render.clearLight(lnp)
                 lnp.removeNode()
+        # Cleanup camera rig (removes display regions)
+        if self._camera_rig:
+            self._camera_rig.cleanup()
         self._planet = None
         self._player = None
         self._camera_rig = None
@@ -480,7 +567,7 @@ class OrbitalGuardian(ShowBase):
 
     def _load_shaders(self):
         """Load GLSL shader programs and attach them to scene objects."""
-        shader_dir = os.path.join(_PROJECT_ROOT, 'graphics', 'shaders')
+        shader_dir = 'graphics/shaders'
 
         # Planet shader
         self._planet_shader = Shader.load(
@@ -564,8 +651,8 @@ class OrbitalGuardian(ShowBase):
         # Camera forward for player-relative movement
         cam_fwd = self._camera_rig.get_forward()
 
-        # Player movement
-        self._player.update(dt, input_vec, cam_fwd)
+        # Player movement (with jump and dash)
+        self._player.update(dt, input_vec, cam_fwd, self._keys['jump'], self._keys['dash'])
 
         # Camera follow
         self._camera_rig.update(dt)
@@ -588,6 +675,11 @@ class OrbitalGuardian(ShowBase):
         # Meteor spawner — returns (explosions, newly_embedded)
         explosions, newly_embedded = self._spawner.update(dt)
 
+        # Check for victory condition (completed wave 10)
+        if self._spawner.wave > 10:
+            self._enter_victory()
+            return
+
         # Fuse explosions damage the planet
         for hit_pos in explosions:
             destroyed = self._planet.take_damage(15)
@@ -595,6 +687,15 @@ class OrbitalGuardian(ShowBase):
             if destroyed:
                 self._enter_game_over()
                 return
+
+        # Health pickup spawner — returns health to restore
+        health_restored = self._health_spawner.update(dt)
+        if health_restored > 0:
+            # Restore planet health (cap at max)
+            self._planet.health = min(self._planet.max_health,
+                                     self._planet.health + health_restored)
+            # Spawn green particles for pickup effect
+            self._particles.spawn_explosion(self._player.position + self._player.get_up() * 2)
 
         # Impact particles for newly embedded meteors (subtle thud)
         for pos in newly_embedded:
@@ -633,7 +734,9 @@ class OrbitalGuardian(ShowBase):
             health_frac,
             self._combat.score,
             self._spawner.wave,
-            self._combat.get_cooldown_fraction()
+            self._combat.get_cooldown_fraction(),
+            self._player.dash_charges,
+            self._player.dash_recharge_progress
         )
 
         # HUD — directional arrows for off-screen meteors

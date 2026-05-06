@@ -138,10 +138,7 @@ class ImpactPredictor:
         self.markers = []
         self._disc_geom = _make_disc_mesh()
 
-        shader_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            '..', 'graphics', 'shaders'
-        )
+        shader_dir = 'graphics/shaders'
         self._shader = Shader.load(
             Shader.SL_GLSL,
             vertex=os.path.join(shader_dir, 'impact_marker.vert.glsl'),

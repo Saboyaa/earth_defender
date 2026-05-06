@@ -65,9 +65,14 @@ class CombatSystem:
             return
 
         # Compute hitbox center — with auto-aim nudge
+        # If jumping, extend hitbox vertically for aerial attacks
+        vertical_offset = 1.0
+        if self.player.is_jumping:
+            vertical_offset = 2.5  # Higher reach during jump
+
         base_center = (self.player.position
                        + self.player.get_forward() * self.HIT_DISTANCE
-                       + self.player.get_up() * 1.0)
+                       + self.player.get_up() * vertical_offset)
 
         hitbox_center = self._auto_aim(base_center)
 
@@ -82,6 +87,9 @@ class CombatSystem:
             effective_radius = self.HIT_RADIUS
             if meteor.state == MeteorState.EMBEDDED:
                 effective_radius = self.HIT_RADIUS + 0.5  # extra generous
+            # Larger hitbox during aerial attacks
+            if self.player.is_jumping:
+                effective_radius = self.HIT_RADIUS + 1.5
             meteor_radius = 1.2
 
             if dist < effective_radius + meteor_radius:
